@@ -48,17 +48,18 @@ impl RoomService {
     pub async fn get_room(&self, name: &str) -> Result<Room, &'static str> {
         let rooms = self.rooms.lock().await;
 
-        rooms
-            .get(name)
-            .cloned()
-            .ok_or("Room not found")
+        rooms.get(name).cloned().ok_or("Room not found")
+    }
+
+    pub async fn list_rooms(&self) -> Vec<Room> {
+        let rooms = self.rooms.lock().await;
+
+        rooms.values().cloned().collect()
     }
 
     pub async fn join_player(&self, name: &str) -> Result<(usize, Room), &'static str> {
         let mut rooms = self.rooms.lock().await;
-        let room = rooms
-            .get_mut(name)
-            .ok_or("Room not found")?;
+        let room = rooms.get_mut(name).ok_or("Room not found")?;
 
         let player = room
             .players
@@ -92,10 +93,7 @@ impl RoomService {
 #[cfg(test)]
 mod tests {
     use super::RoomService;
-    use crate::{
-        models::CreateGame,
-        state::Rooms,
-    };
+    use crate::{models::CreateGame, state::Rooms};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
 
@@ -127,5 +125,33 @@ mod tests {
         service.leave_connection("test_room", Some(1)).await;
         let room_after_leave = service.get_room("test_room").await.unwrap();
         assert!(!room_after_leave.players[0].connected);
+    }
+
+    #[tokio::test]
+    async fn lists_all_created_rooms() {
+        let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
+        let service = RoomService::new(rooms.clone());
+
+        service
+            .create_room(CreateGame {
+                name: "room_a".to_string(),
+                deck_size: 20,
+                initial_chips: [100, 200],
+            })
+            .await
+            .unwrap();
+        service
+            .create_room(CreateGame {
+                name: "room_b".to_string(),
+                deck_size: 30,
+                initial_chips: [50, 150],
+            })
+            .await
+            .unwrap();
+
+        let rooms = service.list_rooms().await;
+        assert_eq!(rooms.len(), 2);
+        assert!(rooms.iter().any(|room| room.name == "room_a"));
+        assert!(rooms.iter().any(|room| room.name == "room_b"));
     }
 }

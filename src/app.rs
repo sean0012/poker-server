@@ -9,7 +9,7 @@ use axum::{
     http::StatusCode,
     middleware,
     response::Response,
-    routing::{get, post},
+    routing::get,
 };
 use tokio::sync::Mutex;
 
@@ -24,7 +24,7 @@ pub async fn run() {
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
 
     let app = Router::new()
-        .route("/rooms", post(create_game))
+        .route("/rooms", get(list_rooms).post(create_game))
         .route("/rooms/{room}", get(get_room_info))
         .route("/rooms/{room}/player", get(join_as_player))
         .route("/rooms/{room}/spectator", get(join_as_spectator))
@@ -86,6 +86,11 @@ async fn create_game(
     );
 
     Ok((StatusCode::CREATED, Json(room)))
+}
+
+async fn list_rooms(State(rooms): State<Rooms>) -> Json<Vec<Room>> {
+    let service = RoomService::new(rooms);
+    Json(service.list_rooms().await)
 }
 
 async fn get_room_info(
