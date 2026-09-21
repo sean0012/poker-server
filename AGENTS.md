@@ -14,6 +14,10 @@
 - 요구사항의 모호함이 게임 규칙이나 API 계약에 영향을 주면 먼저 질문한다.
 - 작은 구현 선택은 기존 코드의 패턴을 따른다.
 
+# Coding style
+
+- Write comments in English
+
 # Features
 
 - Player, spectator 없이도 방을 만들 수 있다
