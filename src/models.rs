@@ -18,6 +18,7 @@ pub struct Player {
 
 #[derive(Clone, Serialize)]
 pub struct Room {
+    pub id: String,
     pub name: String,
     pub deck_size: u32,
     pub remaining_cards: u32,

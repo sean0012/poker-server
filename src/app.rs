@@ -20,6 +20,8 @@ use crate::{
     state::{NEXT_ACTIVITY_ID, Rooms},
 };
 
+const MAX_ROOM_NAME_LENGTH: usize = 40;
+
 pub async fn run() {
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
 
@@ -46,12 +48,7 @@ async fn create_game(
 ) -> Result<(StatusCode, Json<Room>), ApiError> {
     let name = input.name.trim().to_string();
 
-    if name.is_empty()
-        || name.len() > 40
-        || !name
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
-    {
+    if name.is_empty() || name.chars().count() > MAX_ROOM_NAME_LENGTH {
         return Err((StatusCode::BAD_REQUEST, "Invalid room name"));
     }
 
@@ -73,15 +70,12 @@ async fn create_game(
     let room = service
         .create_room(input)
         .await
-        .map_err(|message| match message {
-            "Room already exists" => (StatusCode::CONFLICT, message),
-            _ => (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"),
-        })?;
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"))?;
 
     log_activity(
         "room_created",
         serde_json::json!({
-            "room": room.name, "deck_size": room.deck_size, "initial_chips": room.players.iter().map(|player| player.initial_chips).collect::<Vec<_>>(),
+            "room": room.id, "name": room.name, "deck_size": room.deck_size, "initial_chips": room.players.iter().map(|player| player.initial_chips).collect::<Vec<_>>(),
         }),
     );
 
@@ -94,12 +88,12 @@ async fn list_rooms(State(rooms): State<Rooms>) -> Json<Vec<Room>> {
 }
 
 async fn get_room_info(
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     State(rooms): State<Rooms>,
 ) -> Result<Json<Room>, ApiError> {
     let service = RoomService::new(rooms);
     let room = service
-        .get_room(&name)
+        .get_room(&id)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, "Room not found"))?;
 
@@ -107,19 +101,19 @@ async fn get_room_info(
 }
 
 async fn join_as_player(
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     State(rooms): State<Rooms>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    join(name, rooms, ws, Role::Player).await
+    join(id, rooms, ws, Role::Player).await
 }
 
 async fn join_as_spectator(
-    Path(name): Path<String>,
+    Path(id): Path<String>,
     State(rooms): State<Rooms>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    join(name, rooms, ws, Role::Spectator).await
+    join(id, rooms, ws, Role::Spectator).await
 }
 
 async fn join(

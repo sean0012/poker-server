@@ -1,6 +1,6 @@
 use crate::{
     models::{CreateGame, Gaze, Player, Room},
-    state::Rooms,
+    state::{NEXT_ROOM_ID, Rooms},
 };
 
 #[derive(Clone)]
@@ -20,12 +20,12 @@ impl RoomService {
     pub async fn create_room(&self, input: CreateGame) -> Result<Room, &'static str> {
         let name = input.name.trim().to_string();
         let mut rooms = self.rooms.lock().await;
-
-        if rooms.contains_key(name.as_str()) {
-            return Err("Room already exists");
-        }
+        let id = NEXT_ROOM_ID
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_string();
 
         let room = Room {
+            id: id.clone(),
             name: name.clone(),
             deck_size: input.deck_size,
             remaining_cards: input.deck_size,
@@ -41,7 +41,7 @@ impl RoomService {
             history: Vec::new(),
         };
 
-        rooms.insert(name, room.clone());
+        rooms.insert(id, room.clone());
         Ok(room)
     }
 
@@ -114,16 +114,17 @@ mod tests {
         assert_eq!(room.players[0].seat, 1);
         assert_eq!(room.players[1].seat, 2);
         assert_eq!(room.spectators, 0);
+        assert_eq!(room.name, "test_room");
 
-        let (player_seat, joined_player_room) = service.join_player("test_room").await.unwrap();
+        let (player_seat, joined_player_room) = service.join_player(&room.id).await.unwrap();
         assert_eq!(player_seat, 1);
         assert!(joined_player_room.players[0].connected);
 
-        let spectator_room = service.join_spectator("test_room").await.unwrap();
+        let spectator_room = service.join_spectator(&room.id).await.unwrap();
         assert_eq!(spectator_room.spectators, 1);
 
-        service.leave_connection("test_room", Some(1)).await;
-        let room_after_leave = service.get_room("test_room").await.unwrap();
+        service.leave_connection(&room.id, Some(1)).await;
+        let room_after_leave = service.get_room(&room.id).await.unwrap();
         assert!(!room_after_leave.players[0].connected);
     }
 
@@ -132,17 +133,17 @@ mod tests {
         let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
         let service = RoomService::new(rooms.clone());
 
-        service
+        let first_room = service
             .create_room(CreateGame {
-                name: "room_a".to_string(),
+                name: "room a / 東京".to_string(),
                 deck_size: 20,
                 initial_chips: [100, 200],
             })
             .await
             .unwrap();
-        service
+        let second_room = service
             .create_room(CreateGame {
-                name: "room_b".to_string(),
+                name: "room b".to_string(),
                 deck_size: 30,
                 initial_chips: [50, 150],
             })
@@ -151,7 +152,8 @@ mod tests {
 
         let rooms = service.list_rooms().await;
         assert_eq!(rooms.len(), 2);
-        assert!(rooms.iter().any(|room| room.name == "room_a"));
-        assert!(rooms.iter().any(|room| room.name == "room_b"));
+        assert!(rooms.iter().any(|room| room.name == "room a / 東京"));
+        assert!(rooms.iter().any(|room| room.name == "room b"));
+        assert_ne!(first_room.id, second_room.id);
     }
 }
