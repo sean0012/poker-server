@@ -42,6 +42,7 @@ pub struct CreateGame {
 #[derive(Serialize)]
 pub struct SessionResponse {
     pub user_id: Uuid,
+    pub display_name: String,
     pub avatar: String,
 }
 

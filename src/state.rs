@@ -13,6 +13,7 @@ pub type GuestProfiles = Arc<Mutex<HashMap<String, GuestProfile>>>;
 #[derive(Clone)]
 pub struct GuestProfile {
     pub user_id: Uuid,
+    pub display_name: String,
     pub avatar: String,
 }
 
@@ -35,8 +36,10 @@ pub fn get_or_create_guest_profile(
     }
 
     let token = Uuid::new_v4().simple().to_string();
+    let user_id = Uuid::new_v4();
     let profile = GuestProfile {
-        user_id: Uuid::new_v4(),
+        user_id,
+        display_name: format!("Guest-{}", &user_id.simple().to_string()[..6]),
         avatar: "puppy".to_string(),
     };
     profiles.insert(token.clone(), profile.clone());
@@ -59,6 +62,7 @@ mod tests {
 
         assert_eq!(token, same_token);
         assert_eq!(first.user_id, second.user_id);
+        assert_eq!(first.display_name, second.display_name);
         assert_eq!(first.avatar, "puppy");
     }
 

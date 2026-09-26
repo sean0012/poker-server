@@ -97,6 +97,7 @@ async fn create_or_restore_session(
         [(axum::http::header::SET_COOKIE, cookie)],
         Json(crate::models::SessionResponse {
             user_id: profile.user_id,
+            display_name: profile.display_name,
             avatar: profile.avatar,
         }),
     ))
