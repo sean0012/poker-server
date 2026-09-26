@@ -31,6 +31,7 @@ impl RoomService {
             remaining_cards: input.deck_size,
             players: std::array::from_fn(|index| Player {
                 seat: index + 1,
+                guest_id: None,
                 connected: false,
                 initial_chips: input.initial_chips[index],
                 current_chips: input.initial_chips[index],
@@ -57,16 +58,31 @@ impl RoomService {
         rooms.values().cloned().collect()
     }
 
-    pub async fn join_player(&self, name: &str) -> Result<(usize, Room), &'static str> {
+    pub async fn join_player(
+        &self,
+        name: &str,
+        guest_id: &str,
+    ) -> Result<(usize, Room), &'static str> {
         let mut rooms = self.rooms.lock().await;
         let room = rooms.get_mut(name).ok_or("Room not found")?;
 
-        let player = room
+        let player = if let Some(player) = room
             .players
             .iter_mut()
-            .find(|player| !player.connected)
-            .ok_or("Room is full")?;
+            .find(|player| player.guest_id.as_deref() == Some(guest_id))
+        {
+            if player.connected {
+                return Err("Player is already connected");
+            }
+            player
+        } else {
+            room.players
+                .iter_mut()
+                .find(|player| !player.connected)
+                .ok_or("Room is full")?
+        };
 
+        player.guest_id = Some(guest_id.to_string());
         player.connected = true;
         Ok((player.seat, room.clone()))
     }
@@ -116,9 +132,18 @@ mod tests {
         assert_eq!(room.spectators, 0);
         assert_eq!(room.name, "test_room");
 
-        let (player_seat, joined_player_room) = service.join_player(&room.id).await.unwrap();
+        let (player_seat, joined_player_room) =
+            service.join_player(&room.id, "guest-one").await.unwrap();
         assert_eq!(player_seat, 1);
         assert!(joined_player_room.players[0].connected);
+
+        service.leave_connection(&room.id, Some(1)).await;
+        let (reconnected_seat, _) = service.join_player(&room.id, "guest-one").await.unwrap();
+        assert_eq!(reconnected_seat, 1);
+
+        service.leave_connection(&room.id, Some(1)).await;
+        let (replacement_seat, _) = service.join_player(&room.id, "guest-two").await.unwrap();
+        assert_eq!(replacement_seat, 1);
 
         let spectator_room = service.join_spectator(&room.id).await.unwrap();
         assert_eq!(spectator_room.spectators, 1);

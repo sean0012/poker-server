@@ -10,6 +10,8 @@ pub enum Gaze {
 #[derive(Clone, Serialize)]
 pub struct Player {
     pub seat: usize,
+    #[serde(skip_serializing)]
+    pub guest_id: Option<String>,
     pub connected: bool,
     pub initial_chips: u32,
     pub current_chips: u32,

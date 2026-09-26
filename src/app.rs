@@ -3,7 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use axum::{
     Json, Router,
     extract::{
-        Path, State,
+        Path, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
@@ -11,6 +11,7 @@ use axum::{
     response::Response,
     routing::get,
 };
+use serde::Deserialize;
 use tokio::sync::Mutex;
 
 use crate::{
@@ -21,6 +22,12 @@ use crate::{
 };
 
 const MAX_ROOM_NAME_LENGTH: usize = 40;
+const MAX_GUEST_ID_LENGTH: usize = 100;
+
+#[derive(Deserialize)]
+struct GuestQuery {
+    guest_id: String,
+}
 
 pub async fn run() {
     let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
@@ -102,41 +109,63 @@ async fn get_room_info(
 
 async fn join_as_player(
     Path(id): Path<String>,
+    Query(query): Query<GuestQuery>,
     State(rooms): State<Rooms>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    join(id, rooms, ws, Role::Player).await
+    join(id, query.guest_id, rooms, ws, Role::Player).await
 }
 
 async fn join_as_spectator(
     Path(id): Path<String>,
+    Query(query): Query<GuestQuery>,
     State(rooms): State<Rooms>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    join(id, rooms, ws, Role::Spectator).await
+    join(id, query.guest_id, rooms, ws, Role::Spectator).await
 }
 
 async fn join(
     name: String,
+    guest_id: String,
     rooms: Rooms,
     ws: WebSocketUpgrade,
     role: Role,
 ) -> Result<Response, ApiError> {
+    if !is_valid_guest_id(&guest_id) {
+        return Err((StatusCode::BAD_REQUEST, "Invalid guest ID"));
+    }
+
     let service = RoomService::new(rooms.clone());
     if !service.room_exists(&name).await {
         return Err((StatusCode::NOT_FOUND, "Room not found"));
     }
 
-    Ok(ws.on_upgrade(move |socket| handle_connection(socket, name, rooms, role)))
+    Ok(ws.on_upgrade(move |socket| handle_connection(socket, name, guest_id, rooms, role)))
 }
 
-async fn handle_connection(mut socket: WebSocket, name: String, rooms: Rooms, role: Role) {
+fn is_valid_guest_id(guest_id: &str) -> bool {
+    !guest_id.is_empty()
+        && guest_id.len() <= MAX_GUEST_ID_LENGTH
+        && guest_id.starts_with("guest-")
+        && guest_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+}
+
+async fn handle_connection(
+    mut socket: WebSocket,
+    name: String,
+    guest_id: String,
+    rooms: Rooms,
+    role: Role,
+) {
     let connection_id = NEXT_ACTIVITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let activity = |event: &str, seat: Option<usize>, details: serde_json::Value| {
         log_activity(
             event,
             serde_json::json!({
-                "connection_id": connection_id, "room": name, "role": role,
+                "connection_id": connection_id, "room": name, "guest_id": guest_id, "role": role,
                 "seat": seat, "details": details,
             }),
         );
@@ -145,7 +174,7 @@ async fn handle_connection(mut socket: WebSocket, name: String, rooms: Rooms, ro
     let admission = {
         let service = RoomService::new(rooms.clone());
         match role {
-            Role::Player => match service.join_player(&name).await {
+            Role::Player => match service.join_player(&name, &guest_id).await {
                 Ok((seat, room)) => Ok((Some(seat), room)),
                 Err(message) => Err(message),
             },
