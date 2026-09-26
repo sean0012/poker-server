@@ -3,44 +3,64 @@ use std::{collections::HashMap, sync::Arc};
 use axum::{
     Json, Router,
     extract::{
-        Path, Query, State,
+        Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::StatusCode,
+    http::{HeaderMap, HeaderValue, StatusCode},
     middleware,
     response::Response,
     routing::get,
 };
-use serde::Deserialize;
-use tokio::sync::Mutex;
-use tokio::sync::broadcast;
+use sqlx::postgres::PgPoolOptions;
+use std::time::Duration;
+use tokio::sync::{Mutex, broadcast};
 
 use crate::{
     log::{log_activity, log_request},
     models::{CreateGame, Game, Role, ServerEvent},
     service::GameService,
-    state::{GameUpdates, Games, NEXT_ACTIVITY_ID},
+    state::{
+        AppState, GameUpdates, Games, GuestProfile, GuestProfiles, NEXT_ACTIVITY_ID,
+        get_or_create_guest_profile,
+    },
 };
 
 const MAX_GAME_NAME_LENGTH: usize = 40;
-const MAX_GUEST_ID_LENGTH: usize = 100;
-
-#[derive(Deserialize)]
-struct GuestQuery {
-    guest_id: String,
-}
+const SESSION_COOKIE_NAME: &str = "poker_session";
 
 pub async fn run() {
+    dotenvy::dotenv().ok();
+    let database_url = std::env::var("DATABASE_URL")
+        .expect("DATABASE_URL must point to the Supabase PokerDev PostgreSQL database");
+    let database = PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&database_url)
+        .await
+        .expect("Failed to connect to the configured PostgreSQL database");
+    sqlx::query("SELECT 1")
+        .execute(&database)
+        .await
+        .expect("Could not verify the Supabase PokerDev PostgreSQL connection");
+
     let games: Games = Arc::new(Mutex::new(HashMap::new()));
     let updates: GameUpdates = Arc::new(Mutex::new(HashMap::new()));
+    let guest_profiles: GuestProfiles = Arc::new(Mutex::new(HashMap::new()));
+    let state = AppState {
+        games,
+        game_updates: updates,
+        guest_profiles,
+        _database: database,
+    };
 
     let app = Router::new()
+        .route("/session", axum::routing::post(create_or_restore_session))
         .route("/games", get(list_games).post(create_game))
         .route("/games/{game}", get(get_game_info))
         .route("/games/{game}/player", get(join_as_player))
         .route("/games/{game}/spectator", get(join_as_spectator))
         .layer(middleware::from_fn(log_request))
-        .with_state((games, updates));
+        .with_state(state);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
@@ -51,8 +71,64 @@ pub async fn run() {
     axum::serve(listener, app).await.expect("서버 실행 실패");
 }
 
+async fn create_or_restore_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<
+    (
+        [(axum::http::HeaderName, HeaderValue); 1],
+        Json<crate::models::SessionResponse>,
+    ),
+    ApiError,
+> {
+    let existing_token = get_cookie(&headers, SESSION_COOKIE_NAME);
+    let mut profiles = state.guest_profiles.lock().await;
+    let (token, profile) = get_or_create_guest_profile(&mut profiles, existing_token);
+    let secure = std::env::var("COOKIE_SECURE")
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let secure_attribute = if secure { "; Secure" } else { "" };
+    let cookie = HeaderValue::from_str(&format!(
+        "{SESSION_COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Lax{secure_attribute}"
+    ))
+    .expect("session cookie header must be valid");
+
+    Ok((
+        [(axum::http::header::SET_COOKIE, cookie)],
+        Json(crate::models::SessionResponse {
+            user_id: profile.user_id,
+            avatar: profile.avatar,
+        }),
+    ))
+}
+
+fn get_cookie(headers: &HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(axum::http::header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|part| part.trim().split_once('='))
+        .find_map(|(key, value)| (key == name).then(|| value.to_string()))
+}
+
+async fn session_profile_from_cookie(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<GuestProfile, (StatusCode, &'static str)> {
+    let token = get_cookie(headers, SESSION_COOKIE_NAME)
+        .ok_or((StatusCode::UNAUTHORIZED, "Guest session required"))?;
+    state
+        .guest_profiles
+        .lock()
+        .await
+        .get(&token)
+        .cloned()
+        .ok_or((StatusCode::UNAUTHORIZED, "Guest session expired"))
+}
+
 async fn create_game(
-    State((games, _)): State<(Games, GameUpdates)>,
+    State(state): State<AppState>,
     Json(input): Json<CreateGame>,
 ) -> Result<(StatusCode, Json<Game>), ApiError> {
     let name = input.name.trim().to_string();
@@ -75,7 +151,7 @@ async fn create_game(
         ));
     }
 
-    let service = GameService::new(games);
+    let service = GameService::new(state.games);
     let game = service
         .create_game(input)
         .await
@@ -91,16 +167,16 @@ async fn create_game(
     Ok((StatusCode::CREATED, Json(game)))
 }
 
-async fn list_games(State((games, _)): State<(Games, GameUpdates)>) -> Json<Vec<Game>> {
-    let service = GameService::new(games);
+async fn list_games(State(state): State<AppState>) -> Json<Vec<Game>> {
+    let service = GameService::new(state.games);
     Json(service.list_games().await)
 }
 
 async fn get_game_info(
     Path(id): Path<String>,
-    State((games, _)): State<(Games, GameUpdates)>,
+    State(state): State<AppState>,
 ) -> Result<Json<Game>, ApiError> {
-    let service = GameService::new(games);
+    let service = GameService::new(state.games);
     let game = service
         .get_game(&id)
         .await
@@ -111,57 +187,43 @@ async fn get_game_info(
 
 async fn join_as_player(
     Path(id): Path<String>,
-    Query(query): Query<GuestQuery>,
-    State((games, updates)): State<(Games, GameUpdates)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    join(id, query.guest_id, games, updates, ws, Role::Player).await
+    join(id, state, headers, ws, Role::Player).await
 }
 
 async fn join_as_spectator(
     Path(id): Path<String>,
-    Query(query): Query<GuestQuery>,
-    State((games, updates)): State<(Games, GameUpdates)>,
+    State(state): State<AppState>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    join(id, query.guest_id, games, updates, ws, Role::Spectator).await
+    join(id, state, headers, ws, Role::Spectator).await
 }
 
 async fn join(
     id: String,
-    guest_id: String,
-    games: Games,
-    updates: GameUpdates,
+    state: AppState,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
     role: Role,
 ) -> Result<Response, ApiError> {
-    if !is_valid_guest_id(&guest_id) {
-        return Err((StatusCode::BAD_REQUEST, "Invalid guest ID"));
-    }
-
-    let service = GameService::new(games.clone());
+    let profile = session_profile_from_cookie(&state, &headers).await?;
+    let service = GameService::new(state.games.clone());
     if !service.game_exists(&id).await {
         return Err((StatusCode::NOT_FOUND, "Game not found"));
     }
 
-    Ok(ws.on_upgrade(move |socket| handle_connection(socket, id, guest_id, games, updates, role)))
-}
-
-fn is_valid_guest_id(guest_id: &str) -> bool {
-    !guest_id.is_empty()
-        && guest_id.len() <= MAX_GUEST_ID_LENGTH
-        && guest_id.starts_with("guest-")
-        && guest_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    Ok(ws.on_upgrade(move |socket| handle_connection(socket, id, profile, state, role)))
 }
 
 async fn handle_connection(
     mut socket: WebSocket,
     id: String,
-    guest_id: String,
-    games: Games,
-    updates: GameUpdates,
+    profile: GuestProfile,
+    state: AppState,
     role: Role,
 ) {
     let connection_id = NEXT_ACTIVITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -169,7 +231,7 @@ async fn handle_connection(
         log_activity(
             event,
             serde_json::json!({
-                "connection_id": connection_id, "game": id, "guest_id": guest_id, "role": role,
+                "connection_id": connection_id, "game": id, "user_id": profile.user_id, "role": role,
                 "seat": seat, "details": details,
             }),
         );
@@ -177,7 +239,7 @@ async fn handle_connection(
     activity("websocket_connected", None, serde_json::json!({}));
 
     let mut update_receiver = {
-        let mut update_channels = updates.lock().await;
+        let mut update_channels = state.game_updates.lock().await;
         update_channels
             .entry(id.clone())
             .or_insert_with(|| broadcast::channel(32).0)
@@ -185,9 +247,12 @@ async fn handle_connection(
     };
 
     let admission = {
-        let service = GameService::new(games.clone());
+        let service = GameService::new(state.games.clone());
         match role {
-            Role::Player => match service.join_player(&id, &guest_id).await {
+            Role::Player => match service
+                .join_player(&id, profile.user_id, &profile.avatar)
+                .await
+            {
                 Ok((seat, game)) => Ok((Some(seat), game)),
                 Err(message) => Err(message),
             },
@@ -233,7 +298,7 @@ async fn handle_connection(
                 seat,
                 serde_json::json!({"type": "joined"}),
             );
-            if let Some(channel) = updates.lock().await.get(&id) {
+            if let Some(channel) = state.game_updates.lock().await.get(&id) {
                 let _ = channel.send(());
             }
 
@@ -274,7 +339,7 @@ async fn handle_connection(
                     update = update_receiver.recv() => {
                         match update {
                             Ok(()) => {
-                                if let Ok(game) = GameService::new(games.clone()).get_game(&id).await {
+                                if let Ok(game) = GameService::new(state.games.clone()).get_game(&id).await {
                                     if let Err(error) = send_event(&mut socket, &ServerEvent::GameUpdated { game }).await {
                                         activity(
                                             "websocket_error",
@@ -292,7 +357,7 @@ async fn handle_connection(
                                     seat,
                                     serde_json::json!({"skipped": skipped}),
                                 );
-                                if let Ok(game) = GameService::new(games.clone()).get_game(&id).await {
+                                if let Ok(game) = GameService::new(state.games.clone()).get_game(&id).await {
                                     if let Err(error) = send_event(&mut socket, &ServerEvent::GameUpdated { game }).await {
                                         activity(
                                             "websocket_error",
@@ -320,12 +385,12 @@ async fn handle_connection(
         }
     }
 
-    if GameService::new(games)
+    if GameService::new(state.games.clone())
         .leave_connection(&id, seat)
         .await
         .is_some()
     {
-        if let Some(channel) = updates.lock().await.get(&id) {
+        if let Some(channel) = state.game_updates.lock().await.get(&id) {
             let _ = channel.send(());
         }
     }

@@ -2,6 +2,7 @@ use crate::{
     models::{CreateGame, Game, Gaze, Player},
     state::{Games, NEXT_GAME_ID},
 };
+use uuid::Uuid;
 
 #[derive(Clone)]
 pub struct GameService {
@@ -31,7 +32,8 @@ impl GameService {
             remaining_cards: input.deck_size,
             players: std::array::from_fn(|index| Player {
                 seat: index + 1,
-                guest_id: None,
+                user_id: None,
+                avatar: "puppy".to_string(),
                 connected: false,
                 initial_chips: input.initial_chips[index],
                 current_chips: input.initial_chips[index],
@@ -61,7 +63,8 @@ impl GameService {
     pub async fn join_player(
         &self,
         id: &str,
-        guest_id: &str,
+        user_id: Uuid,
+        avatar: &str,
     ) -> Result<(usize, Game), &'static str> {
         let mut games = self.games.lock().await;
         let game = games.get_mut(id).ok_or("Game not found")?;
@@ -69,7 +72,7 @@ impl GameService {
         let player = if let Some(player) = game
             .players
             .iter_mut()
-            .find(|player| player.guest_id.as_deref() == Some(guest_id))
+            .find(|player| player.user_id == Some(user_id))
         {
             if player.connected {
                 return Err("Player is already connected");
@@ -82,7 +85,8 @@ impl GameService {
                 .ok_or("Game is full")?
         };
 
-        player.guest_id = Some(guest_id.to_string());
+        player.user_id = Some(user_id);
+        player.avatar = avatar.to_string();
         player.connected = true;
         Ok((player.seat, game.clone()))
     }
@@ -115,6 +119,7 @@ mod tests {
     use crate::{models::CreateGame, state::Games};
     use std::{collections::HashMap, sync::Arc};
     use tokio::sync::Mutex;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn creates_and_assigns_players_and_spectators() {
@@ -132,20 +137,35 @@ mod tests {
 
         assert_eq!(game.players[0].seat, 1);
         assert_eq!(game.players[1].seat, 2);
+        assert_eq!(game.players[0].avatar, "puppy");
+        assert_eq!(game.players[1].avatar, "puppy");
         assert_eq!(game.spectators, 0);
         assert_eq!(game.name, "test_game");
 
-        let (player_seat, joined_player_game) =
-            service.join_player(&game.id, "guest-one").await.unwrap();
+        let guest_one = Uuid::new_v4();
+        let (player_seat, joined_player_game) = service
+            .join_player(&game.id, guest_one, "puppy")
+            .await
+            .unwrap();
         assert_eq!(player_seat, 1);
         assert!(joined_player_game.players[0].connected);
+        assert_eq!(joined_player_game.players[0].avatar, "puppy");
+        let serialized = serde_json::to_value(&joined_player_game).unwrap();
+        assert!(serialized["players"][0].get("user_id").is_none());
+        assert_eq!(serialized["players"][0]["avatar"], "puppy");
 
         service.leave_connection(&game.id, Some(1)).await;
-        let (reconnected_seat, _) = service.join_player(&game.id, "guest-one").await.unwrap();
+        let (reconnected_seat, _) = service
+            .join_player(&game.id, guest_one, "puppy")
+            .await
+            .unwrap();
         assert_eq!(reconnected_seat, 1);
 
         service.leave_connection(&game.id, Some(1)).await;
-        let (replacement_seat, _) = service.join_player(&game.id, "guest-two").await.unwrap();
+        let (replacement_seat, _) = service
+            .join_player(&game.id, Uuid::new_v4(), "puppy")
+            .await
+            .unwrap();
         assert_eq!(replacement_seat, 1);
 
         let spectator_game = service.join_spectator(&game.id).await.unwrap();

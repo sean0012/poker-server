@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Clone, Copy, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -11,7 +12,8 @@ pub enum Gaze {
 pub struct Player {
     pub seat: usize,
     #[serde(skip_serializing)]
-    pub guest_id: Option<String>,
+    pub user_id: Option<Uuid>,
+    pub avatar: String,
     pub connected: bool,
     pub initial_chips: u32,
     pub current_chips: u32,
@@ -35,6 +37,12 @@ pub struct CreateGame {
     pub name: String,
     pub deck_size: u32,
     pub initial_chips: [u32; 2],
+}
+
+#[derive(Serialize)]
+pub struct SessionResponse {
+    pub user_id: Uuid,
+    pub avatar: String,
 }
 
 #[derive(Clone, Copy, Serialize)]

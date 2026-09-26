@@ -1,7 +1,7 @@
 # Project
 
 - 시선 이동을 활용하는 1:1 인디언 포커 게임.
-- Rust, Axum, Tokio, WebSocket.
+- Rust, Axum, Tokio, WebSocket, SQLx, Supabase Postgres.
 - 개발자는 코드를 직접 이해하고 검증하면서 단계적으로 개발한다.
 
 # Work scope
