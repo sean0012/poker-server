@@ -19,7 +19,7 @@ pub struct Player {
 }
 
 #[derive(Clone, Serialize)]
-pub struct Room {
+pub struct Game {
     pub id: String,
     pub name: String,
     pub deck_size: u32,
@@ -50,7 +50,7 @@ pub enum ServerEvent {
     Joined {
         role: Role,
         seat: Option<usize>,
-        room: Room,
+        game: Game,
     },
     Error {
         message: &'static str,

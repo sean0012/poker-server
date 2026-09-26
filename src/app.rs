@@ -16,12 +16,12 @@ use tokio::sync::Mutex;
 
 use crate::{
     log::{log_activity, log_request},
-    models::{CreateGame, Role, Room, ServerEvent},
-    service::RoomService,
-    state::{NEXT_ACTIVITY_ID, Rooms},
+    models::{CreateGame, Game, Role, ServerEvent},
+    service::GameService,
+    state::{Games, NEXT_ACTIVITY_ID},
 };
 
-const MAX_ROOM_NAME_LENGTH: usize = 40;
+const MAX_GAME_NAME_LENGTH: usize = 40;
 const MAX_GUEST_ID_LENGTH: usize = 100;
 
 #[derive(Deserialize)]
@@ -30,15 +30,15 @@ struct GuestQuery {
 }
 
 pub async fn run() {
-    let rooms: Rooms = Arc::new(Mutex::new(HashMap::new()));
+    let games: Games = Arc::new(Mutex::new(HashMap::new()));
 
     let app = Router::new()
-        .route("/rooms", get(list_rooms).post(create_game))
-        .route("/rooms/{room}", get(get_room_info))
-        .route("/rooms/{room}/player", get(join_as_player))
-        .route("/rooms/{room}/spectator", get(join_as_spectator))
+        .route("/games", get(list_games).post(create_game))
+        .route("/games/{game}", get(get_game_info))
+        .route("/games/{game}/player", get(join_as_player))
+        .route("/games/{game}/spectator", get(join_as_spectator))
         .layer(middleware::from_fn(log_request))
-        .with_state(rooms);
+        .with_state(games);
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
@@ -50,13 +50,13 @@ pub async fn run() {
 }
 
 async fn create_game(
-    State(rooms): State<Rooms>,
+    State(games): State<Games>,
     Json(input): Json<CreateGame>,
-) -> Result<(StatusCode, Json<Room>), ApiError> {
+) -> Result<(StatusCode, Json<Game>), ApiError> {
     let name = input.name.trim().to_string();
 
-    if name.is_empty() || name.chars().count() > MAX_ROOM_NAME_LENGTH {
-        return Err((StatusCode::BAD_REQUEST, "Invalid room name"));
+    if name.is_empty() || name.chars().count() > MAX_GAME_NAME_LENGTH {
+        return Err((StatusCode::BAD_REQUEST, "Invalid game name"));
     }
 
     if input.deck_size == 0 || input.deck_size % 10 != 0 {
@@ -73,62 +73,62 @@ async fn create_game(
         ));
     }
 
-    let service = RoomService::new(rooms);
-    let room = service
-        .create_room(input)
+    let service = GameService::new(games);
+    let game = service
+        .create_game(input)
         .await
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error"))?;
 
     log_activity(
-        "room_created",
+        "game_created",
         serde_json::json!({
-            "room": room.id, "name": room.name, "deck_size": room.deck_size, "initial_chips": room.players.iter().map(|player| player.initial_chips).collect::<Vec<_>>(),
+            "game": game.id, "name": game.name, "deck_size": game.deck_size, "initial_chips": game.players.iter().map(|player| player.initial_chips).collect::<Vec<_>>(),
         }),
     );
 
-    Ok((StatusCode::CREATED, Json(room)))
+    Ok((StatusCode::CREATED, Json(game)))
 }
 
-async fn list_rooms(State(rooms): State<Rooms>) -> Json<Vec<Room>> {
-    let service = RoomService::new(rooms);
-    Json(service.list_rooms().await)
+async fn list_games(State(games): State<Games>) -> Json<Vec<Game>> {
+    let service = GameService::new(games);
+    Json(service.list_games().await)
 }
 
-async fn get_room_info(
+async fn get_game_info(
     Path(id): Path<String>,
-    State(rooms): State<Rooms>,
-) -> Result<Json<Room>, ApiError> {
-    let service = RoomService::new(rooms);
-    let room = service
-        .get_room(&id)
+    State(games): State<Games>,
+) -> Result<Json<Game>, ApiError> {
+    let service = GameService::new(games);
+    let game = service
+        .get_game(&id)
         .await
-        .map_err(|_| (StatusCode::NOT_FOUND, "Room not found"))?;
+        .map_err(|_| (StatusCode::NOT_FOUND, "Game not found"))?;
 
-    Ok(Json(room))
+    Ok(Json(game))
 }
 
 async fn join_as_player(
     Path(id): Path<String>,
     Query(query): Query<GuestQuery>,
-    State(rooms): State<Rooms>,
+    State(games): State<Games>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    join(id, query.guest_id, rooms, ws, Role::Player).await
+    join(id, query.guest_id, games, ws, Role::Player).await
 }
 
 async fn join_as_spectator(
     Path(id): Path<String>,
     Query(query): Query<GuestQuery>,
-    State(rooms): State<Rooms>,
+    State(games): State<Games>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    join(id, query.guest_id, rooms, ws, Role::Spectator).await
+    join(id, query.guest_id, games, ws, Role::Spectator).await
 }
 
 async fn join(
-    name: String,
+    id: String,
     guest_id: String,
-    rooms: Rooms,
+    games: Games,
     ws: WebSocketUpgrade,
     role: Role,
 ) -> Result<Response, ApiError> {
@@ -136,12 +136,12 @@ async fn join(
         return Err((StatusCode::BAD_REQUEST, "Invalid guest ID"));
     }
 
-    let service = RoomService::new(rooms.clone());
-    if !service.room_exists(&name).await {
-        return Err((StatusCode::NOT_FOUND, "Room not found"));
+    let service = GameService::new(games.clone());
+    if !service.game_exists(&id).await {
+        return Err((StatusCode::NOT_FOUND, "Game not found"));
     }
 
-    Ok(ws.on_upgrade(move |socket| handle_connection(socket, name, guest_id, rooms, role)))
+    Ok(ws.on_upgrade(move |socket| handle_connection(socket, id, guest_id, games, role)))
 }
 
 fn is_valid_guest_id(guest_id: &str) -> bool {
@@ -155,9 +155,9 @@ fn is_valid_guest_id(guest_id: &str) -> bool {
 
 async fn handle_connection(
     mut socket: WebSocket,
-    name: String,
+    id: String,
     guest_id: String,
-    rooms: Rooms,
+    games: Games,
     role: Role,
 ) {
     let connection_id = NEXT_ACTIVITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -165,21 +165,21 @@ async fn handle_connection(
         log_activity(
             event,
             serde_json::json!({
-                "connection_id": connection_id, "room": name, "guest_id": guest_id, "role": role,
+                "connection_id": connection_id, "game": id, "guest_id": guest_id, "role": role,
                 "seat": seat, "details": details,
             }),
         );
     };
     activity("websocket_connected", None, serde_json::json!({}));
     let admission = {
-        let service = RoomService::new(rooms.clone());
+        let service = GameService::new(games.clone());
         match role {
-            Role::Player => match service.join_player(&name, &guest_id).await {
-                Ok((seat, room)) => Ok((Some(seat), room)),
+            Role::Player => match service.join_player(&id, &guest_id).await {
+                Ok((seat, game)) => Ok((Some(seat), game)),
                 Err(message) => Err(message),
             },
-            Role::Spectator => match service.join_spectator(&name).await {
-                Ok(room) => Ok((None, room)),
+            Role::Spectator => match service.join_spectator(&id).await {
+                Ok(game) => Ok((None, game)),
                 Err(message) => Err(message),
             },
         }
@@ -205,11 +205,11 @@ async fn handle_connection(
         }
     };
 
-    activity("room_joined", seat, serde_json::json!({}));
+    activity("game_joined", seat, serde_json::json!({}));
     let event = ServerEvent::Joined {
         role,
         seat,
-        room: snapshot,
+        game: snapshot,
     };
 
     let mut disconnect_reason = "stream_ended";
@@ -262,8 +262,8 @@ async fn handle_connection(
         }
     }
 
-    RoomService::new(rooms).leave_connection(&name, seat).await;
-    activity("room_left", seat, serde_json::json!({}));
+    GameService::new(games).leave_connection(&id, seat).await;
+    activity("game_left", seat, serde_json::json!({}));
     activity(
         "websocket_disconnected",
         seat,
