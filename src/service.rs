@@ -94,7 +94,7 @@ impl GameService {
         Ok(game.clone())
     }
 
-    pub async fn leave_connection(&self, id: &str, seat: Option<usize>) {
+    pub async fn leave_connection(&self, id: &str, seat: Option<usize>) -> Option<Game> {
         let mut games = self.games.lock().await;
 
         if let Some(game) = games.get_mut(id) {
@@ -102,6 +102,9 @@ impl GameService {
                 Some(seat) => game.players[seat - 1].connected = false,
                 None => game.spectators = game.spectators.saturating_sub(1),
             }
+            Some(game.clone())
+        } else {
+            None
         }
     }
 }

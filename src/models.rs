@@ -52,6 +52,9 @@ pub enum ServerEvent {
         seat: Option<usize>,
         game: Game,
     },
+    GameUpdated {
+        game: Game,
+    },
     Error {
         message: &'static str,
     },

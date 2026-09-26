@@ -13,12 +13,13 @@ use axum::{
 };
 use serde::Deserialize;
 use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 
 use crate::{
     log::{log_activity, log_request},
     models::{CreateGame, Game, Role, ServerEvent},
     service::GameService,
-    state::{Games, NEXT_ACTIVITY_ID},
+    state::{GameUpdates, Games, NEXT_ACTIVITY_ID},
 };
 
 const MAX_GAME_NAME_LENGTH: usize = 40;
@@ -31,6 +32,7 @@ struct GuestQuery {
 
 pub async fn run() {
     let games: Games = Arc::new(Mutex::new(HashMap::new()));
+    let updates: GameUpdates = Arc::new(Mutex::new(HashMap::new()));
 
     let app = Router::new()
         .route("/games", get(list_games).post(create_game))
@@ -38,7 +40,7 @@ pub async fn run() {
         .route("/games/{game}/player", get(join_as_player))
         .route("/games/{game}/spectator", get(join_as_spectator))
         .layer(middleware::from_fn(log_request))
-        .with_state(games);
+        .with_state((games, updates));
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
         .await
@@ -50,7 +52,7 @@ pub async fn run() {
 }
 
 async fn create_game(
-    State(games): State<Games>,
+    State((games, _)): State<(Games, GameUpdates)>,
     Json(input): Json<CreateGame>,
 ) -> Result<(StatusCode, Json<Game>), ApiError> {
     let name = input.name.trim().to_string();
@@ -89,14 +91,14 @@ async fn create_game(
     Ok((StatusCode::CREATED, Json(game)))
 }
 
-async fn list_games(State(games): State<Games>) -> Json<Vec<Game>> {
+async fn list_games(State((games, _)): State<(Games, GameUpdates)>) -> Json<Vec<Game>> {
     let service = GameService::new(games);
     Json(service.list_games().await)
 }
 
 async fn get_game_info(
     Path(id): Path<String>,
-    State(games): State<Games>,
+    State((games, _)): State<(Games, GameUpdates)>,
 ) -> Result<Json<Game>, ApiError> {
     let service = GameService::new(games);
     let game = service
@@ -110,25 +112,26 @@ async fn get_game_info(
 async fn join_as_player(
     Path(id): Path<String>,
     Query(query): Query<GuestQuery>,
-    State(games): State<Games>,
+    State((games, updates)): State<(Games, GameUpdates)>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    join(id, query.guest_id, games, ws, Role::Player).await
+    join(id, query.guest_id, games, updates, ws, Role::Player).await
 }
 
 async fn join_as_spectator(
     Path(id): Path<String>,
     Query(query): Query<GuestQuery>,
-    State(games): State<Games>,
+    State((games, updates)): State<(Games, GameUpdates)>,
     ws: WebSocketUpgrade,
 ) -> Result<Response, ApiError> {
-    join(id, query.guest_id, games, ws, Role::Spectator).await
+    join(id, query.guest_id, games, updates, ws, Role::Spectator).await
 }
 
 async fn join(
     id: String,
     guest_id: String,
     games: Games,
+    updates: GameUpdates,
     ws: WebSocketUpgrade,
     role: Role,
 ) -> Result<Response, ApiError> {
@@ -141,7 +144,7 @@ async fn join(
         return Err((StatusCode::NOT_FOUND, "Game not found"));
     }
 
-    Ok(ws.on_upgrade(move |socket| handle_connection(socket, id, guest_id, games, role)))
+    Ok(ws.on_upgrade(move |socket| handle_connection(socket, id, guest_id, games, updates, role)))
 }
 
 fn is_valid_guest_id(guest_id: &str) -> bool {
@@ -158,6 +161,7 @@ async fn handle_connection(
     id: String,
     guest_id: String,
     games: Games,
+    updates: GameUpdates,
     role: Role,
 ) {
     let connection_id = NEXT_ACTIVITY_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -171,6 +175,15 @@ async fn handle_connection(
         );
     };
     activity("websocket_connected", None, serde_json::json!({}));
+
+    let mut update_receiver = {
+        let mut update_channels = updates.lock().await;
+        update_channels
+            .entry(id.clone())
+            .or_insert_with(|| broadcast::channel(32).0)
+            .subscribe()
+    };
+
     let admission = {
         let service = GameService::new(games.clone());
         match role {
@@ -209,7 +222,7 @@ async fn handle_connection(
     let event = ServerEvent::Joined {
         role,
         seat,
-        game: snapshot,
+        game: snapshot.clone(),
     };
 
     let mut disconnect_reason = "stream_ended";
@@ -220,9 +233,15 @@ async fn handle_connection(
                 seat,
                 serde_json::json!({"type": "joined"}),
             );
-            while let Some(incoming) = socket.recv().await {
-                match incoming {
-                    Ok(message) => {
+            if let Some(channel) = updates.lock().await.get(&id) {
+                let _ = channel.send(());
+            }
+
+            loop {
+                tokio::select! {
+                    incoming = socket.recv() => {
+                        match incoming {
+                            Some(Ok(message)) => {
                         let (kind, bytes) = match &message {
                             Message::Text(value) => ("text", value.len()),
                             Message::Binary(value) => ("binary", value.len()),
@@ -239,15 +258,54 @@ async fn handle_connection(
                             disconnect_reason = "client_close";
                             break;
                         }
+                            }
+                            Some(Err(error)) => {
+                                activity(
+                                    "websocket_error",
+                                    seat,
+                                    serde_json::json!({"operation": "receive", "error": error.to_string()}),
+                                );
+                                disconnect_reason = "receive_error";
+                                break;
+                            }
+                            None => break,
+                        }
                     }
-                    Err(error) => {
-                        activity(
-                            "websocket_error",
-                            seat,
-                            serde_json::json!({"operation": "receive", "error": error.to_string()}),
-                        );
-                        disconnect_reason = "receive_error";
-                        break;
+                    update = update_receiver.recv() => {
+                        match update {
+                            Ok(()) => {
+                                if let Ok(game) = GameService::new(games.clone()).get_game(&id).await {
+                                    if let Err(error) = send_event(&mut socket, &ServerEvent::GameUpdated { game }).await {
+                                        activity(
+                                            "websocket_error",
+                                            seat,
+                                            serde_json::json!({"operation": "send_update", "error": error.to_string()}),
+                                        );
+                                        disconnect_reason = "send_error";
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                activity(
+                                    "websocket_update_lagged",
+                                    seat,
+                                    serde_json::json!({"skipped": skipped}),
+                                );
+                                if let Ok(game) = GameService::new(games.clone()).get_game(&id).await {
+                                    if let Err(error) = send_event(&mut socket, &ServerEvent::GameUpdated { game }).await {
+                                        activity(
+                                            "websocket_error",
+                                            seat,
+                                            serde_json::json!({"operation": "send_resync", "error": error.to_string()}),
+                                        );
+                                        disconnect_reason = "send_error";
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
                     }
                 }
             }
@@ -262,7 +320,15 @@ async fn handle_connection(
         }
     }
 
-    GameService::new(games).leave_connection(&id, seat).await;
+    if GameService::new(games)
+        .leave_connection(&id, seat)
+        .await
+        .is_some()
+    {
+        if let Some(channel) = updates.lock().await.get(&id) {
+            let _ = channel.send(());
+        }
+    }
     activity("game_left", seat, serde_json::json!({}));
     activity(
         "websocket_disconnected",
